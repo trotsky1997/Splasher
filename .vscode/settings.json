@@ -1,8 +1,0 @@
-{
-    "editor.suggest.snippetsPreventQuickSuggestions": false,
-    "aiXcoder.showTrayIcon": true,
-    "docwriter.progress.trackFunctions": true,
-    "docwriter.progress.trackClasses": true,
-    "editor.tabCompletion": "on",
-    "diffEditor.codeLens": true
-}
