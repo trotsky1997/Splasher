@@ -1,0 +1,8 @@
+torch
+numpy
+pandas
+playsound
+pywin32
+console
+pyttsx3
+aspeak
