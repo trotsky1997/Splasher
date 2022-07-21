@@ -1,6 +1,7 @@
-mp3/*
+
 *.pkl
 /__pycache__
 /.vscode
 /model.pkl
 /optimizer.pkl
+/mp3

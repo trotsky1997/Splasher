@@ -10,7 +10,7 @@ It can tuning words' weight of reappear dynamicly according to your learning pro
 
 # Installation
 
-```
+```bash
 git clone https://github.com/trotsky1997/Splasher.git
 cd Splasher
 pip install -r requirements.txt
