@@ -1,4 +1,5 @@
 import os
+import random
 import sys
 import threading
 import time
@@ -18,18 +19,19 @@ torch.autograd.set_detect_anomaly(True)
 
 rewards = []
 q_values = []
+q_next_values = []
 discount = 0.75
-discount_length = 5
+discount_length = 20
 stop_words = []
 
 
-# def get_stop_words(db, old_stats):
-#     # nums = int(old_stats[4]*old_stats[3]*len(db['word']))
-#     nums = int((old_stats[2] - 0.03)*len(db['word']))
-#     new_db = db.copy()
-#     # new_db['right-wrong'] = new_db['right_times'] - new_db['wrong_times']
-#     new_db = new_db.sort_values(by='right_times', ascending=False)
-#     return new_db['word'].values[:nums].tolist()
+def get_stop_words(db, old_stats):
+    # nums = int(old_stats[4]*old_stats[3]*len(db['word']))
+    nums = int((old_stats[3] *old_stats[4] - 0.01)*len(db['word']))
+    new_db = db.copy()
+    new_db['right/wrong'] = (new_db['right_times']-1) / (new_db['wrong_times'] + new_db['right_times'] + 1)
+    new_db = new_db.sort_values(by='right/wrong', ascending=False)
+    return new_db.index[:nums].tolist()
 
 
 def tts(text):
@@ -68,7 +70,9 @@ def load_db(path='./2400_words.csv'):
 
 def save_db(db, path='./2400_words.csv'):
     db.to_csv(path, index=False, header=False)
-
+    db2 = db.copy()
+    db2['acc'] = (db2['right_times']) / (db2['right_times'] + db2['wrong_times'] + 1)
+    db2.to_excel(path.replace('.csv', '.xlsx'), index=False, header=False)
 
 def get_random_word(db):
     return db.sample(1).index
@@ -77,34 +81,44 @@ def get_random_word(db):
 class policy_network(torch.nn.Module):
     def __init__(self, word_nums, attr_nums,):
         super(policy_network, self).__init__()
-        self.fc1 = torch.nn.Linear(attr_nums*word_nums, word_nums//2)
-        self.fc2 = torch.nn.Linear(word_nums//2, word_nums//4)
-        self.miu_layer = torch.nn.Linear(word_nums//4, word_nums)
-        self.logsigma_layer = torch.nn.Linear(word_nums//4, word_nums)
-        self.gamma = nn.Parameter(torch.randn(1))
-        self.beta = nn.Parameter(torch.randn(1))
-        self.epsilon = nn.Parameter(torch.randn(1))
-        self.scale = nn.Parameter(torch.tensor([1.0]))
+        self.fc1 = nn.Linear(3,3)
+        self.fc2 = nn.Linear(3,3)
+        self.fc3 = nn.Linear(3,1)
+        self.miu = nn.Linear(2400,2400)
+        self.logsigma = nn.Linear(2400,2400)
+        self.masker = nn.Linear(2400,2400)
+        self.decoder = nn.Linear(2400,2400)
 
-    def forward(self, x, mode='train'):
-        x = self.norm(x)
+    def scaled_dot_attention(self,x):
+        return torch.softmax(x.mm(x.transpose(-1,-2))/ x.shape[0] ** 0.5,-1).mm(x)
+
+    def forward(self, x1,x2, mode='train'):
+        x3 = (x1-x2)/(x1+x2+1.0)
+        x3 = self.norm(x3,summ=False).unsqueeze(1)
+        x1 = self.norm(x1).unsqueeze(1)
+        x2 = self.norm(x2).unsqueeze(1)
+        x = torch.cat([x1,x2,x3], dim=-1)
         x = F.relu(self.fc1(x))
+        x = x + self.scaled_dot_attention(x)
         x = F.relu(self.fc2(x))
-        miu = self.miu_layer(x)
-        if mode == 'train':
-            logsigma = self.logsigma_layer(x)
-            logit = self.scale*torch.randn(miu.shape) * torch.exp(logsigma) + miu
+        x_pre = x = F.relu(self.fc3(x)).squeeze()
+        # x = torch.softmax(self.fc3(x).squeeze(),-1)
+        miu = self.miu(x)
+        logsigma = self.logsigma(x)
+        mask = torch.sigmoid(self.masker(x))
+        noisy = torch.randn(x.shape)
+        if self.training:
+            x_sample = miu + noisy*torch.exp(logsigma)
         else:
-            logit = miu
-        score = torch.softmax(logit, -1)
-        return score
+            x_sample = miu
+        x_decode = F.relu(self.decoder(x_sample))
+        score = torch.softmax(x_decode,-1) * mask
+        return score,F.mse_loss(x_pre,x_decode),-F.kl_div(x_sample,noisy)
 
-    def sample(self, x):
-        return torch.argmax(self.forward(x, mode='eval'))
-
-    def norm(self, x):
-        x = x / x.sum()
-        return x#(x - x.mean())/(x.var() + self.epsilon).sqrt() * self.gamma + self.beta
+    def norm(self, x,summ=True):
+        if summ:
+            x = x / x.sum()
+        return (x - x.mean())/x.std()
 
 
 def warm_up(db, times):
@@ -122,19 +136,28 @@ def warm_up(db, times):
         index = get_random_word(db)
         study_step(db, index)
 
-
+index_old = None
 def env_step(db, model, optimizer):
-    global rewards,q_values
-    score = model(flatten_db(db))
+    global rewards,q_values,index_old,q_next_values,stop_words_indexes,additive_losses
+    score,rec_loss,kl_loss = model(*flatten_db(db))
+    # s_temp = score.detach().data.clone()
+    # s_temp[stop_words_indexes] = -1
     index = torch.argmax(score)
-    # if db['word'].values[index] in stop_words:
-    #     return
     q_value = score[index]
     o_old = get_objective_value(db)
+    
     while True:
         ans = wait_key()
         if ans == 'q':
             quit(db, model, optimizer)
+        elif ans == 't' and not (index_old is None):
+            hint = input(f"type hint for {db['word'].values[index_old]}:")
+            if hint != '':
+                db.loc[index_old.item(), 'definition'] += "hint:"+hint
+                save_db(db)
+                break
+            else:
+                break
         else:
             break
     tts(db['word'].values[index])
@@ -142,67 +165,94 @@ def env_step(db, model, optimizer):
     o_new = get_objective_value(db)
     reward = o_new - o_old
     rewards.append(reward)
-    rewards = rewards[-discount_length:]
     q_values.append(q_value)
-    q_values = q_values[-discount_length:]
+    with torch.no_grad():
+        model.eval()
+        scores,_,_ = model(*flatten_db(db))
+        q_next_value = scores[index]
+        q_next_values.append(q_next_value)
+        model.train()
     # print(loss.item())
+    additive_losses.append(rec_loss+kl_loss)
     optimizer_step(optimizer)
+    index_old = index
     # time.sleep(1.5)
     # tts_lock.release()
 
 
 losses = []
-batch_size = 4
+additive_losses = []
+batch_size = 1
 
 
 def optimizer_step(optimizer):
-    global losses, batch_size,rewards,q_values
+    global losses, batch_size,rewards,q_values,q_next_values,additive_losses
     if len(losses) >= batch_size:
         optimizer.zero_grad()
-        torch.stack(losses[1:]).sum().backward()
+        loss = torch.stack(losses).sum()
+        loss.backward()
         optimizer.step()
         losses = []
-        rewards = []
         q_values = []
+        rewards = []
+        q_next_values = []
+        additive_losses = []
     else:
-        if len(rewards) >= 2:
+        if len(q_next_values) >= 1:
             reward = sum(ix * discount ** i for i ,ix in enumerate(rewards))
-            loss = get_loss(reward,q_values[0],q_values[1])
+            loss = get_loss(reward,q_values[0],q_next_values[0])+additive_losses[0]
             losses.append(loss)
+            q_values = q_values[1:]
+            rewards = rewards[1:]
+            q_next_values = q_next_values[1:]
+            additive_losses = additive_losses[1:]
 
+counter = 0
 def study_step(db, index):
-    print('\n'+db['word'].values[index].center(24, " "))
+    global counter,batchsize
+    # calculate the sorted index of the words wrong_times
+    rank = db['wrong_times'].rank(pct=True,ascending=True)[index]
+    acc = db['right_times'].values[index]/(1 + db['right_times'].values[index] + db['wrong_times'].values[index])
+    print('\n'+db['word'].values[index].center(24, " "),f'({counter}/{batch_size}|{acc:.2%}|{rank:.2%})')
+    counter = (counter + 1)% batch_size 
     # tts(db['word'].values[index])
     while True:
         ans = wait_key()
         if ans == '\r':
-            db.loc[index, 'right_times'] += 1
+            db.loc[index, 'right_times'] = db.loc[index, 'right_times'] * 0.9 + 1
+            db.loc[index, 'wrong_times'] = db.loc[index, 'wrong_times'] *0.9
             break
             # reward = -10
         elif ans == 'q':
             quit(db, model, optimizer)
             break
+        elif ans == 't':
+            print("hint:",random.choice(db['definition'].values[index].split("hint:")).center(24, " "))
         elif ans == ' ':
-            db.loc[index, 'wrong_times'] += 1
+            db.loc[index, 'right_times'] = db.loc[index, 'right_times'] * 0.9
+            db.loc[index, 'wrong_times'] = db.loc[index, 'wrong_times'] *0.9 + 1
             break
         # reward = 20
-    print(db['definition'].values[index].center(24, " "))
+    print(db['definition'].values[index].split("hint:")[0].center(24, " "))
+    if len(db['definition'].values[index].split("hint:")) > 1:
+        print("hint:",random.choice(db['definition'].values[index].split("hint:")[1:]).center(24, " "))
     tts(db['word'].values[index])
     # return reward
 
 
 def get_objective_value(db):
-    a = (db['right_times'] != 0).sum()/len(db['word'])
+    a = (db['right_times'] > 0).sum()/len(db['word'])
     b = ((db['right_times']+db['wrong_times']) != 0).sum()/len(db['word'])
     c = (db['right_times'] > db['wrong_times']).sum() / \
         ((db['right_times']+db['wrong_times']) != 0).sum()
     score = calc_score(db)
-    return score*8 + a*4 + b + c*6
+    return (score*10+a*8+b+c)*10000
 
 
 def calc_score(db):
-    # scale = len(db['word'])/((db['right_times']+db['wrong_times']) != 0).sum()
-    return ((db['right_times'] - db['wrong_times']) / (db['right_times'] + db['wrong_times'] + 1) * db['wrong_times']).sum() / db['wrong_times'].sum()
+    # scale = ((db['right_times']+db['wrong_times']) != 0).sum() / len(db['word'])
+    score =  ((db['right_times']) / (db['right_times'] + db['wrong_times'] + 1) * (db['wrong_times']+1)).sum() / (db['wrong_times'].sum() + len(db['word']))
+    return score
 
 
 def get_loss(reward, old_q, new_q):
@@ -210,7 +260,7 @@ def get_loss(reward, old_q, new_q):
 
 
 def flatten_db(db):
-    return torch.tensor(db[['wrong_times', 'right_times']].values).flatten().float()
+    return torch.tensor(db[['right_times']].values).flatten().float(),torch.tensor(db[['wrong_times']].values).flatten().float()
 
 
 def save_model(model):
@@ -238,7 +288,7 @@ old_stats = None
 
 def print_stats(db):
     global old_stats
-    a, b, c, d, e, f = db['wrong_times'].sum(), db['right_times'].sum(), (db['right_times'] != 0).sum()/len(db['word']), ((db['right_times']+db['wrong_times'])
+    a, b, c, d, e, f = db['wrong_times'].sum(), db['right_times'].sum(), (db['right_times'] > 1).sum()/len(db['word']), ((db['right_times']+db['wrong_times'])
                                                                                                                           != 0).sum()/len(db['word']), (db['right_times'] > db['wrong_times']).sum() / ((db['right_times']+db['wrong_times']) != 0).sum(), calc_score(db)
 
     if old_stats is None:
@@ -268,15 +318,15 @@ def load_optimizer(optimizer):
 if __name__ == '__main__':
     db = load_db()
     print_stats(db)
-    # stop_words = get_stop_words(db, old_stats)
+
+    stop_words_indexes = get_stop_words(db, old_stats)
     model = policy_network(len(db['word']), len(db.columns)-2)
     model = load_model(model)
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-6,momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-6,weight_decay=1e-4,amsgrad=True)
     # optimizer = load_optimizer(optimizer)
     # warm_up(db,10)
 
     print('press any key to start...')
     while True:
         env_step(db, model, optimizer)
-    quit(db, model)
- 
+    quit(db, model) 
